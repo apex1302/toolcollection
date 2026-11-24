@@ -20,8 +20,14 @@ SHOW_NAME = "SchleFaZ"
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".avi", ".mov", ".m4v", ".webm", ".mpg", ".mpeg"}
 SKIP_SUFFIXES = (".ia.mp4", ".thumbs.mp4")
 
+# Format-Priorität: 0 = mkv (höchste), 1 = mp4, 2 = beliebig sonst
+FORMAT_PRIORITY = {
+    ".mkv": 0,
+    ".mp4": 1,
+}
+
 HEADERS = {
-    "User-Agent": "SchleFaZ-Plex-Downloader"
+    "User-Agent": "SchleFaZ-Plex-Downloader/1.3 (personal media organizer)"
 }
 
 
@@ -68,6 +74,26 @@ def parse_episode_info(filename: str) -> tuple[int | None, int | None, str]:
     return None, None, normalized
 
 
+def build_dedup_key(season: int | None, episode: int | None, title: str) -> tuple:
+    """
+    Erzeugt einen Schlüssel zum Erkennen doppelter Folgen derselben Episode.
+    Bei bekannter Staffel + Episode wird (season, episode) genutzt,
+    sonst ein normalisierter Titel-Schlüssel.
+    """
+    if season is not None and episode is not None:
+        return ("ep", season, episode)
+
+    norm_title = re.sub(r"[^a-z0-9äöüß]+", " ", title.lower()).strip()
+    norm_title = re.sub(r"\s+", " ", norm_title)
+    return ("title", norm_title)
+
+
+def get_format_rank(filename: str) -> int:
+    """Gibt die Priorität des Videoformats zurück (0 = mkv, 1 = mp4, 2 = sonst)."""
+    ext = Path(filename).suffix.lower()
+    return FORMAT_PRIORITY.get(ext, 2)
+
+
 def build_plex_path(base_dir: Path, show_name: str, filename: str) -> Path:
     """
     Erzeugt einen Plex-konformen Pfad:
@@ -99,20 +125,27 @@ def format_bytes(num_bytes: float) -> str:
     return f"{num_bytes:.2f} PB"
 
 
-def load_completed_from_csv(csv_path: Path) -> set[str]:
-    """Liest bereits erfolgreich heruntergeladene Quelldateinamen aus der CSV."""
-    completed: set[str] = set()
+def load_completed_from_csv(csv_path: Path) -> tuple[set[str], set[tuple]]:
+    """
+    Liest bereits erfolgreich heruntergeladene Eintraege aus der CSV.
+    Gibt (completed_remote_names, completed_dedup_keys) zurueck.
+    """
+    completed_names: set[str] = set()
+    completed_keys: set[tuple] = set()
+
     if not csv_path.exists():
-        return completed
+        return completed_names, completed_keys
 
     with open(csv_path, mode="r", encoding="utf-8", newline="") as f:
         reader = csv.DictReader(f)
         for row in reader:
             remote_name = (row.get("remote_name") or "").strip()
             if remote_name:
-                completed.add(remote_name)
+                completed_names.add(remote_name)
+                season, episode, title = parse_episode_info(remote_name)
+                completed_keys.add(build_dedup_key(season, episode, title))
 
-    return completed
+    return completed_names, completed_keys
 
 
 def append_to_csv(csv_path: Path, remote_name: str, dest_path: Path, size_bytes: int) -> None:
@@ -155,24 +188,62 @@ def fetch_video_files() -> list[dict]:
         if any(lower_name.endswith(suf) for suf in SKIP_SUFFIXES):
             continue
 
+        season, episode, title = parse_episode_info(name)
+        dedup_key = build_dedup_key(season, episode, title)
+        fmt_rank = get_format_rank(name)
+
         videos.append(
             {
                 "name": name,
                 "size": int(f.get("size") or 0),
+                "season": season,
+                "episode": episode,
+                "title": title,
+                "dedup_key": dedup_key,
+                "fmt_rank": fmt_rank,
             }
         )
 
-    def sort_key(item: dict):
-        s, e, title = parse_episode_info(item["name"])
-        return (
-            s if s is not None else 999,
-            e if e is not None else 999,
-            title.lower(),
+    return videos
+
+
+def select_best_unique_videos(videos: list[dict]) -> tuple[list[dict], int]:
+    """
+    Waehlt pro Episode/Film nur die beste Datei nach Format-Prioritaet:
+      1. .mkv (fmt_rank 0)
+      2. .mp4 (fmt_rank 1)
+      3. beliebige andere Formate (fmt_rank 2)
+    Bei gleichem Format-Rang wird die groessere Datei bevorzugt.
+    Gibt (ausgewaehlte_videos, anzahl_verworfenener_dubletten) zurueck.
+    """
+    best_by_key: dict[tuple, dict] = {}
+
+    for vid in videos:
+        key = vid["dedup_key"]
+        current_best = best_by_key.get(key)
+
+        if current_best is None:
+            best_by_key[key] = vid
+            continue
+
+        candidate_rank = (vid["fmt_rank"], -vid["size"], vid["name"].lower())
+        best_rank = (current_best["fmt_rank"], -current_best["size"], current_best["name"].lower())
+
+        if candidate_rank < best_rank:
+            best_by_key[key] = vid
+
+    selected = list(best_by_key.values())
+    duplicates_removed = len(videos) - len(selected)
+
+    selected.sort(
+        key=lambda item: (
+            item["season"] if item["season"] is not None else 999,
+            item["episode"] if item["episode"] is not None else 999,
+            item["title"].lower(),
             item["name"].lower(),
         )
-
-    videos.sort(key=sort_key)
-    return videos
+    )
+    return selected, duplicates_removed
 
 
 def print_live_progress(downloaded: int, total: int | None, speed_bps: float) -> None:
@@ -287,27 +358,36 @@ def download_single_file(
 
 def main():
     print(f"Lade Dateiliste von {METADATA_URL} ...")
-    videos = fetch_video_files()
+    raw_videos = fetch_video_files()
 
-    if not videos:
+    if not raw_videos:
         print("Keine Videodateien gefunden (oder Item nicht erreichbar).")
         return
 
-    completed_files = load_completed_from_csv(CSV_LOG_PATH)
-    missing_videos = [v for v in videos if v["name"] not in completed_files]
+    unique_videos, duplicates_removed = select_best_unique_videos(raw_videos)
+    completed_names, completed_keys = load_completed_from_csv(CSV_LOG_PATH)
+
+    missing_videos = [
+        v
+        for v in unique_videos
+        if v["name"] not in completed_names and v["dedup_key"] not in completed_keys
+    ]
 
     total_size_gb = sum(v["size"] for v in missing_videos) / (1024**3)
-    print(f"Gesamt auf Archive.org: {len(videos)} Videos")
-    print(f"Bereits laut CSV geladen: {len(completed_files)} Videos ({CSV_LOG_PATH})")
-    print(f"Noch herunterzuladen:   {len(missing_videos)} Videos (ca. {total_size_gb:.2f} GB)\n")
+    print(f"Videodateien gesamt auf Archive.org: {len(raw_videos)}")
+    print(f"Mehrfachversionen herausgefiltert:    {duplicates_removed}")
+    print(f"Eindeutige Episoden/Filme:           {len(unique_videos)}")
+    print(f"Bereits laut CSV geladen:            {len(completed_names)} Eintraege ({CSV_LOG_PATH})")
+    print(f"Noch herunterzuladen:                {len(missing_videos)} Videos (ca. {total_size_gb:.2f} GB)\n")
 
     if not missing_videos:
-        print("Alle Videos wurden laut CSV bereits vollstaendig heruntergeladen.")
+        print("Alle eindeutigen Videos wurden laut CSV bereits vollstaendig heruntergeladen.")
         return
 
     for idx, vid in enumerate(missing_videos, start=1):
         dest_file = build_plex_path(OUTPUT_DIR, SHOW_NAME, vid["name"])
-        print(f"[{idx}/{len(missing_videos)}] Quelle: {vid['name']}")
+        fmt_label = Path(vid["name"]).suffix.lower().lstrip(".") or "video"
+        print(f"[{idx}/{len(missing_videos)}] Quelle ({fmt_label}): {vid['name']}")
         success, final_size = download_single_file(
             vid["name"], dest_file, expected_size=vid["size"]
         )
