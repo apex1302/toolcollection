@@ -21,7 +21,7 @@ VIDEO_EXTENSIONS = {".mp4", ".mkv", ".avi", ".mov", ".m4v", ".webm", ".mpg", ".m
 SKIP_SUFFIXES = (".ia.mp4", ".thumbs.mp4")
 
 HEADERS = {
-    "User-Agent": "SchleFaZ-Plex-Downloader/1.2 (personal media organizer)"
+    "User-Agent": "SchleFaZ-Plex-Downloader"
 }
 
 
